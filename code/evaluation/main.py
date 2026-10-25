@@ -199,6 +199,56 @@ class ContractTests(unittest.TestCase):
         )
         self.assertEqual(audit.status_from_record(record), "ABSENT")
 
+    def test_structured_json_log_preserves_fields_and_trace_context(self) -> None:
+        record = audit.parse_text_record(
+            '2026-02-03T05:53:54Z {"service":"account_service",'
+            '"trace_id":"tr-4410322","resource_id":"account_1234",'
+            '"event":"profile_lookup_completed","rows":"0","http_status":"404"}',
+            {"file_id": "evidence_json_log", "captured_at": "2026-02-03T06:00:00Z"},
+        )
+        self.assertIsNotNone(record)
+        self.assertEqual(record.values["service"], "account_service")
+        self.assertEqual(record.values["trace_id"], "tr-4410322")
+        self.assertEqual(record.values["event_time"], "2026-02-03T05:53:54Z")
+        self.assertEqual(audit.status_from_record(record), "ABSENT")
+
+    def test_replica_names_resolve_to_canonical_system(self) -> None:
+        self.assertEqual(
+            audit.system_for({"service": "support_replica"}, "support_1234"),
+            "support_platform",
+        )
+
+    def test_identity_link_activity_does_not_infer_record_category(self) -> None:
+        subject = audit.Subject("case_link", "person@example.test", "user_07")
+        subject.add("user_07")
+        record = audit.activity_link_records(
+            [{
+                "event_type": "LINK_RESOURCE_IDENTITY",
+                "event_time": "2026-01-01T00:00:00Z",
+                "activity_id": "activity_link",
+                "system_id": "data_catalog",
+                "resource_id": "object_19",
+                "details": "Attachment catalog confirmed object_19 belongs to user_07.",
+            }],
+            {"audit_at": "2026-01-02T00:00:00Z"},
+            subject,
+        )
+        self.assertEqual(len(record), 1)
+        self.assertEqual(record[0].category, "UNKNOWN")
+
+    def test_unrelated_direct_identifier_does_not_mark_record_as_subject_pii(self) -> None:
+        record = audit.EvidenceRecord(
+            resource_id="support_1234",
+            system_id="support_platform",
+            category="SUPPORT_MESSAGE",
+            values={"requester_email": "agent@example.test"},
+            evidence_id="evidence_shared_message",
+            captured_at="2026-01-01T00:00:00Z",
+        )
+        subject = audit.Subject("case_shared", "person@example.test", "user_1234")
+        subject.add("person@example.test")
+        self.assertFalse(audit.pii_fields_present(record, subject))
+
 
 def main() -> None:
     expected = load_rows(ROOT / "dataset" / "sample_output.csv")

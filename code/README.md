@@ -33,6 +33,9 @@ are correlated by request/trace ID so an identity-bearing query can be linked
 to its resource result. Full-scope SQL and JSON snapshots can establish
 evidence-backed absence only when both the evidence capture and snapshot time
 are at or before the case's `audit_at`.
+Structured JSON logs retain their event fields, replica system names normalize
+to canonical services, and identity-link activity alone is not treated as
+proof that a deletable record exists.
 
 ## Package
 

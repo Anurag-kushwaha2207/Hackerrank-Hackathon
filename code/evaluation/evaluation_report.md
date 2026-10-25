@@ -8,8 +8,8 @@ The deterministic evaluator compares the generated predictions with
 | Metric | Result |
 | --- | ---: |
 | Case-level deletion-status accuracy | 32/32 (100.0%) |
-| Step-level accuracy | 50.69% |
-| Field-level accuracy | 85.36% |
+| Step-level accuracy | 52.09% |
+| Field-level accuracy | 86.43% |
 | Exact sequence accuracy | 7/32 (21.88%) |
 
 Status accuracy is strong on the public sample, but exact step sequences remain
@@ -41,6 +41,12 @@ The focused tests in `evaluation/main.py` supplement the public sample:
 - Some logs used pipe-delimited trace IDs or `requestId=` instead of a
   `trace_id=` field. Trace parsing now correlates identity-bearing lookup
   events with the resource result, including separate completed/404 results.
+- Structured JSON log lines are parsed as JSON instead of loose key/value
+  text, preserving event fields and timestamps for reliable trace matching.
+- Replica system names are normalized to their canonical service IDs. Catalog
+  identity-link events are no longer treated as proof that a data record
+  exists, and direct PII fields are checked against the resolved subject
+  rather than unrelated people in shared records.
 - A profile's business-level `account_status=DELETED` was previously liable to
   be confused with physical row deletion. The classifier now treats a row as
   present unless evidence explicitly establishes absence, such as a zero-row

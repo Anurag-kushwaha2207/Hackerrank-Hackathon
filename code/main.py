@@ -318,6 +318,12 @@ def system_for(context: dict[str, Any], resource_id: str = "") -> str:
     for key in ("system_id", "data_store", "origin_system", "source_system", "target_system", "system", "service"):
         raw = str(context.get(key, "")).strip()
         if raw and raw.casefold() not in {"none", "unknown"}:
+            normalized = raw.casefold()
+            for suffix in ("_replica", "_primary", "_failover"):
+                if normalized.endswith(suffix):
+                    normalized = normalized[: -len(suffix)]
+                    prefix = normalized.split("_", 1)[0]
+                    return SYSTEM_BY_PREFIX.get(prefix, normalized)
             return raw
     prefix = resource_id.split("_", 1)[0].casefold() if resource_id else ""
     for known, system in SYSTEM_BY_PREFIX.items():
@@ -524,7 +530,7 @@ def activity_link_records(
             EvidenceRecord(
                 resource_id=resource_id,
                 system_id=system_for(activity, resource_id),
-                category=category_for(activity, resource_id, details),
+                category=category_for(activity, resource_id),
                 values=values,
                 evidence_id=activity["activity_id"],
                 captured_at=activity["event_time"],
@@ -539,10 +545,26 @@ def parse_text_record(line: str, manifest_row: dict[str, str]) -> EvidenceRecord
     if not resources:
         return None
     resource_id = resources[0]
-    values = {key.casefold(): value.strip('"\'') for key, value in KEY_VALUE_RE.findall(line)}
+    timestamp, separator, payload = line.partition(" ")
+    values: dict[str, Any] = {}
+    if separator and payload.lstrip().startswith("{"):
+        try:
+            structured = json.loads(payload)
+        except json.JSONDecodeError:
+            structured = None
+        if isinstance(structured, dict):
+            values.update(flatten_values(structured))
+            values["event_time"] = timestamp
+    if not values:
+        values.update(
+            {
+                key.casefold(): value.strip('"\'')
+                for key, value in KEY_VALUE_RE.findall(line)
+            }
+        )
     trace_match = TRACE_ID_RE.search(line)
     if trace_match:
-        values["trace_id"] = trace_match.group(1)
+        values.setdefault("trace_id", trace_match.group(1))
     parts = [part.strip() for part in line.split("|")]
     for index, value in enumerate(parts):
         if value and index not in (0,):
@@ -771,7 +793,10 @@ def pii_fields_present(record: EvidenceRecord, subject: Subject) -> bool:
             or "email_hash" in short_key
         ):
             text = str(value).strip().casefold()
-            if text not in {"null", "none", "redacted", "anonymized", "anonymised", "deleted", "***"}:
+            if (
+                text not in {"null", "none", "redacted", "anonymized", "anonymised", "deleted", "***"}
+                and subject.matches(str(value))
+            ):
                 return True
     if record.category not in REDACT_CATEGORIES | ANONYMIZE_CATEGORIES:
         return False
