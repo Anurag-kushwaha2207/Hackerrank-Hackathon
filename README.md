@@ -31,10 +31,21 @@ Your solution must:
 - Generate one prediction row for every request in `dataset/deletion_requests.csv`
 - Write the final predictions to `output.csv` in the repository root
 
-Run the starter Python entry point with:
+Install the parser requirements and run the audit agent from the repository
+root:
 
 ```bash
-python3 code/main.py
+python -m pip install -r code/requirements.txt
+python -m pip install -r code/requirements-ocr.txt
+python code/main.py
+```
+
+The OCR requirements are needed to inspect screenshot evidence. The agent
+writes the completed predictions to the repository-root `output.csv`. Run the
+public sample checks with:
+
+```bash
+python code/evaluation/main.py
 ```
 
 The blank template at `dataset/output.csv` is provided as a reference. Your final generated file for submission must be the root-level `output.csv`.
