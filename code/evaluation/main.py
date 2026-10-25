@@ -199,6 +199,42 @@ class ContractTests(unittest.TestCase):
         )
         self.assertEqual(audit.status_from_record(record), "ABSENT")
 
+    def test_account_absence_evidence_must_postdate_the_deletion_request(self) -> None:
+        record = audit.EvidenceRecord(
+            "account_test",
+            "account_service",
+            "USER_PROFILE",
+            {"rows": "0", "http_status": "404"},
+            "evidence_stale_account",
+            "2026-01-01T00:00:00Z",
+            source_text=(
+                "profile_lookup_completed lookup_key=person@example.test "
+                "rows=0 http_status=404"
+            ),
+        )
+        result = audit.audit_case(
+            {
+                "case_id": "case_stale_account",
+                "email": "person@example.test",
+                "requested_at": "2026-02-01T00:00:00Z",
+                "audit_at": "2026-02-02T00:00:00Z",
+                "request_text": "Please delete my account.",
+            },
+            [record],
+            [],
+            {},
+            {"person@example.test": {"user_test"}},
+            {},
+            [],
+        )
+        self.assertFalse(
+            any(
+                step["resource_id"] == "account_test"
+                and step["operation"] == "VERIFY_RECORD_ABSENT"
+                for step in result["steps"]
+            )
+        )
+
     def test_structured_json_log_preserves_fields_and_trace_context(self) -> None:
         record = audit.parse_text_record(
             '2026-02-03T05:53:54Z {"service":"account_service",'
@@ -229,6 +265,33 @@ class ContractTests(unittest.TestCase):
         subject = audit.Subject("case_readback", "person@example.test", None)
         subject.add("person@example.test")
         self.assertTrue(audit.linked_record(record, subject))
+
+    def test_text_log_event_time_obeys_audit_cutoff(self) -> None:
+        record = audit.parse_text_record(
+            "2026-02-03T06:01:00Z service=account_service "
+            "resource_id=account_1234 rows=0 http_status=404",
+            {"file_id": "evidence_cutoff", "captured_at": "2026-02-03T07:00:00Z"},
+        )
+        self.assertIsNotNone(record)
+        self.assertEqual(record.values["event_time"], "2026-02-03T06:01:00Z")
+        self.assertFalse(
+            audit.available_at_cutoff(
+                record,
+                audit.parse_time("2026-02-03T06:00:00Z"),
+            )
+        )
+
+    def test_text_log_state_fields_survive_event_timestamp_parsing(self) -> None:
+        record = audit.parse_text_record(
+            "2026-02-03T05:53:54Z service=backup_service "
+            "resource_id=backup_1234 event=restore_candidate_evaluated "
+            "eligible=true deletion_block=false",
+            {"file_id": "evidence_restore_log", "captured_at": "2026-02-03T06:00:00Z"},
+        )
+        self.assertIsNotNone(record)
+        self.assertEqual(record.values["eligible"], "true")
+        self.assertEqual(record.values["deletion_block"], "false")
+        self.assertEqual(audit.status_from_record(record), "ACTIVE")
 
     def test_replica_names_resolve_to_canonical_system(self) -> None:
         self.assertEqual(

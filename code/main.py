@@ -637,13 +637,10 @@ def parse_text_record(line: str, manifest_row: dict[str, str]) -> EvidenceRecord
         if isinstance(structured, dict):
             values.update(flatten_values(structured))
             values["event_time"] = timestamp
-    if not values:
-        values.update(
-            {
-                key.casefold(): value.strip('"\'')
-                for key, value in KEY_VALUE_RE.findall(line)
-            }
-        )
+    if timestamp and parse_time(timestamp):
+        values.setdefault("event_time", timestamp)
+    for key, value in KEY_VALUE_RE.findall(line):
+        values.setdefault(key.casefold(), value.strip('"\''))
     trace_match = TRACE_ID_RE.search(line)
     if trace_match:
         values.setdefault("trace_id", trace_match.group(1))
@@ -806,6 +803,28 @@ def available_at_cutoff(record: EvidenceRecord, cutoff: datetime | None) -> bool
         if key.casefold().split(".")[-1] in timestamp_fields
         for event_time in [parse_time(str(value))]
     )
+
+
+def record_observation_time(record: EvidenceRecord) -> datetime | None:
+    for field_name in (
+        "observed_at",
+        "event_time",
+        "snapshot_at",
+        "updated_at",
+        "recorded_at",
+        "captured_at",
+    ):
+        value = next(
+            (
+                parse_time(str(raw_value))
+                for key, raw_value in record.values.items()
+                if key.casefold().split(".")[-1] == field_name and raw_value
+            ),
+            None,
+        )
+        if value:
+            return value
+    return parse_time(record.captured_at)
 
 
 def status_from_record(record: EvidenceRecord) -> str:
@@ -1127,8 +1146,13 @@ def audit_case(
             elif state not in {"ABSENT", "NOT_FOUND"}:
                 verifications[(record.system_id, record.resource_id, "VERIFY_RECORD_PRESENT")] = make_step("VERIFICATION", record.system_id, record.resource_id, "VERIFY_RECORD_PRESENT", "PRESENT", record.evidence_id)
     account_records = [r for r in evidence if r.category == "USER_PROFILE"]
+    request_time = parse_time(request.get("requested_at"))
     for record in account_records:
-        if status_from_record(record) == "ABSENT":
+        observed_at = record_observation_time(record)
+        if (
+            status_from_record(record) == "ABSENT"
+            and (not request_time or (observed_at and observed_at >= request_time))
+        ):
             verifications[(record.system_id, record.resource_id, "VERIFY_RECORD_ABSENT")] = make_step(
                 "VERIFICATION", record.system_id, record.resource_id, "VERIFY_RECORD_ABSENT", "ABSENT", record.evidence_id
             )

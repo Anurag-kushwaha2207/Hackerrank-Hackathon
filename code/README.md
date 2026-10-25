@@ -39,7 +39,8 @@ proof that a deletable record exists. Identity links join to actual evidence
 only by exact resource ID. Empty SQL tables provide table-scoped snapshot
 coverage; account activity is used only to correlate a likely resource with a
 request, while the activity result itself is never accepted as proof of
-deletion.
+deletion. Log-entry timestamps are checked against `audit_at`, and absence
+observed before the deletion request is not used as post-request verification.
 
 ## Package
 

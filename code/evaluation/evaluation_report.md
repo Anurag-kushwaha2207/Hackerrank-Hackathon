@@ -8,9 +8,9 @@ The deterministic evaluator compares the generated predictions with
 | Metric | Result |
 | --- | ---: |
 | Case-level deletion-status accuracy | 32/32 (100.0%) |
-| Step-level accuracy | 62.00% |
-| Field-level accuracy | 86.92% |
-| Exact sequence accuracy | 14/32 (43.75%) |
+| Step-level accuracy | 63.32% |
+| Field-level accuracy | 87.61% |
+| Exact sequence accuracy | 15/32 (46.88%) |
 
 Status accuracy is strong on the public sample, but exact step sequences remain
 the main weakness. Similar steps with different resource selection or ordering
@@ -44,6 +44,9 @@ The focused tests in `evaluation/main.py` supplement the public sample:
 - Structured JSON log lines are parsed as JSON instead of loose key/value
   text, preserving event fields and timestamps for reliable trace matching.
 - Readback trace IDs with both `tr-` and `rb-` prefixes are correlated.
+- Text-log event timestamps are retained and checked against `audit_at`;
+  an old account-absence observation from before the deletion request is not
+  used as proof of the later audited state.
 - Replica system names are normalized to their canonical service IDs. Catalog
   identity-link events are not treated as proof that a data record exists;
   instead, they link the subject only to actual evidence with the same resource
@@ -63,7 +66,7 @@ The focused tests in `evaluation/main.py` supplement the public sample:
   be confused with physical row deletion. The classifier now treats a row as
   present unless evidence explicitly establishes absence, such as a zero-row
   lookup or HTTP 404.
-- Exact-sequence accuracy improved from 7/32 to 14/32 after these changes.
+- Exact-sequence accuracy improved from 7/32 to 15/32 after these changes.
   Remaining mismatches largely involve resources that the public expected
   output associates with a person even though no participant-facing identity
   link to that resource is available by the case cutoff. The implementation
