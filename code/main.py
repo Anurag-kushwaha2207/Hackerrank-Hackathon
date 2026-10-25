@@ -77,6 +77,26 @@ TABLE_CATEGORIES = {
     "connector_subscriptions": "DATA_FLOW",
 }
 
+TABLE_SYSTEM_PREFIXES = {
+    "customer_profiles": "account_service",
+    "secondary_identifiers": "account_service",
+    "customer_search_documents": "search_service",
+    "cache_entries": "cache_service",
+    "customer_analytics_profiles": "analytics_platform",
+    "product_telemetry": "analytics_platform",
+    "support_records": "support_platform",
+    "support_messages": "support_platform",
+    "support_attachments": "support_platform",
+    "customer_exports": "export_service",
+    "marketing_profiles": "marketing_service",
+    "email_delivery_logs": "email_service",
+    "security_audit_records": "security_service",
+    "legal_hold_records": "legal_service",
+    "backup_restore_entries": "backup_service",
+    "account_tombstones": "account_service",
+    "connector_subscriptions": "integration_service",
+}
+
 SYSTEM_BY_PREFIX = {
     "account": "account_service",
     "search": "search_service",
@@ -141,9 +161,10 @@ RESOURCE_RE = re.compile(
 )
 KEY_VALUE_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_.-]*)\s*[:=]\s*([^\s,|]+)")
 TRACE_ID_RE = re.compile(
-    r"(?:\btrace_id\s*=\s*|\brequestId\s*=\s*|\|\s*)(tr-[A-Za-z0-9_-]+)",
+    r"(?:\btrace_id\s*=\s*|\brequestId\s*=\s*|\|\s*)((?:tr|rb)-[A-Za-z0-9_-]+)",
     re.IGNORECASE,
 )
+ACCOUNT_EVENT_CORRELATION_WINDOW_SECONDS = 600
 
 
 @dataclass
@@ -325,6 +346,12 @@ def system_for(context: dict[str, Any], resource_id: str = "") -> str:
                     prefix = normalized.split("_", 1)[0]
                     return SYSTEM_BY_PREFIX.get(prefix, normalized)
             return raw
+    table_name = str(context.get("table", "")).casefold()
+    for table_prefix, system in sorted(
+        TABLE_SYSTEM_PREFIXES.items(), key=lambda item: len(item[0]), reverse=True
+    ):
+        if table_name.startswith(table_prefix):
+            return system
     prefix = resource_id.split("_", 1)[0].casefold() if resource_id else ""
     for known, system in SYSTEM_BY_PREFIX.items():
         if resource_id.casefold().startswith(known + "_"):
@@ -338,6 +365,11 @@ def category_for(context: dict[str, Any], resource_id: str, source_text: str = "
         candidates.append(str(context.get(key, "")))
     candidates.append(source_text)
     haystack = " ".join(candidates).casefold()
+    event = str(context.get("event", "")).casefold()
+    if "contact_query" in haystack and "legacy_contact_index" in haystack:
+        return "SECONDARY_IDENTIFIER"
+    if "contact_lookup" in event and context.get("email_opt_in") is not None:
+        return "MARKETING_PROFILE"
     for table, category in TABLE_CATEGORIES.items():
         if table.casefold() in haystack:
             if category == "SUPPORT_MESSAGE" and "attachment" in haystack:
@@ -454,6 +486,29 @@ def sql_records(path: Path, manifest_row: dict[str, str]) -> list[EvidenceRecord
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         ).fetchall()
         table_names = tuple(name for (name,) in tables)
+        if "snapshot_scope" not in table_names:
+            for table in table_names:
+                category = TABLE_CATEGORIES.get(
+                    table, category_for({"table": table}, "")
+                )
+                system = system_for({"table": table})
+                if category == "UNKNOWN" or system == "unknown_system":
+                    continue
+                records.append(
+                    EvidenceRecord(
+                        resource_id=f"snapshot_scope_{system}_{table}",
+                        system_id=system,
+                        category="SNAPSHOT_SCOPE",
+                        values={
+                            "origin_system": system,
+                            "collection": table,
+                            "snapshot_at": manifest_row["captured_at"],
+                        },
+                        evidence_id=manifest_row["file_id"],
+                        captured_at=manifest_row["captured_at"],
+                        snapshot_tables=(table,),
+                    )
+                )
         if "snapshot_scope" in table_names:
             scope_rows = connection.execute(
                 "SELECT origin_system, captured_at FROM snapshot_scope"
@@ -530,7 +585,7 @@ def activity_link_records(
             EvidenceRecord(
                 resource_id=resource_id,
                 system_id=system_for(activity, resource_id),
-                category=category_for(activity, resource_id),
+                category="IDENTITY_LINK",
                 values=values,
                 evidence_id=activity["activity_id"],
                 captured_at=activity["event_time"],
@@ -538,6 +593,33 @@ def activity_link_records(
             )
         )
     return result
+
+
+def reported_account_deletion_activity(
+    request: dict[str, str], activities: list[dict[str, str]]
+) -> dict[str, str] | None:
+    reported_at = parse_time(request.get("reported_at"))
+    audit_at = parse_time(request.get("audit_at"))
+    if not reported_at or not audit_at:
+        return None
+    candidates = []
+    for activity in activities:
+        if (
+            activity.get("target_system") != "account_service"
+            or activity.get("event_type") != "DELETE_RECORD"
+            or activity.get("source_system") != "deletion_worker"
+        ):
+            continue
+        event_time = parse_time(activity.get("event_time"))
+        if not event_time or event_time > audit_at:
+            continue
+        distance = abs((event_time - reported_at).total_seconds())
+        if distance <= ACCOUNT_EVENT_CORRELATION_WINDOW_SECONDS:
+            candidates.append((distance, activity))
+    candidates.sort(key=lambda candidate: candidate[0])
+    if len(candidates) != 1:
+        return None
+    return candidates[0][1]
 
 
 def parse_text_record(line: str, manifest_row: dict[str, str]) -> EvidenceRecord | None:
@@ -658,6 +740,9 @@ def load_evidence(manifest: list[dict[str, str]]) -> list[EvidenceRecord]:
                 trace_id = str(record.values.get("trace_id", "")).casefold()
                 if trace_id in trace_text:
                     record.source_text = "\n".join(trace_text[trace_id])
+                    record.category = category_for(
+                        record.values, record.resource_id, record.source_text
+                    )
             records.extend(file_records)
         elif suffix == ".pdf":
             try:
@@ -762,6 +847,14 @@ def status_from_record(record: EvidenceRecord) -> str:
         return "BLOCKED"
     if restore_allowed in {"1", "true", "yes", "allowed", "enabled", "active"}:
         return "ACTIVE"
+    deletion_block = state_fields.get("deletion_block")
+    eligible = state_fields.get("eligible")
+    if deletion_block in {"1", "true", "yes"}:
+        return "BLOCKED"
+    if eligible in {"0", "false", "no"}:
+        return "BLOCKED"
+    if eligible in {"1", "true", "yes"} and deletion_block in {"0", "false", "no"}:
+        return "ACTIVE"
     if re.search(r"\bnot[_ ]found\b|\babsent\b|\brows=0\b|\bhttp_status=404\b", lowered):
         return "ABSENT"
     if state_fields.get("record_exists") in {"0", "false", "no"}:
@@ -856,9 +949,6 @@ def required_action(
         state = status_from_record(record)
         if state != "ACTIVE":
             return "DELETE"
-    if record.category in ANONYMIZE_CATEGORIES and "still attributable" in condition:
-        if not pii_fields_present(record, subject):
-            return None
     return action
 
 
@@ -930,7 +1020,27 @@ def audit_case(
         return {"case_id": request["case_id"], "deletion_status": "NOT_APPLICABLE", "steps": []}
     subject = resolve_subject(request, aliases, profiles, history)
     evidence = evidence_records_for_case(request, records, subject)
-    evidence.extend(activity_link_records(activities, request, subject))
+    identity_links = activity_link_records(activities, request, subject)
+    linked_resources = {record.resource_id for record in identity_links}
+    if linked_resources:
+        cutoff = parse_time(request.get("audit_at"))
+        evidence.extend(
+            record
+            for record in records
+            if record.resource_id in linked_resources
+            and available_at_cutoff(record, cutoff)
+        )
+    evidence.extend(identity_links)
+    account_activity = reported_account_deletion_activity(request, activities)
+    account_resource = account_activity.get("resource_id", "") if account_activity else ""
+    if account_resource:
+        evidence.extend(
+            record
+            for record in records
+            if record.resource_id == account_resource
+            and record.system_id == "account_service"
+            and available_at_cutoff(record, parse_time(request.get("audit_at")))
+        )
 
     findings: list[dict[str, Any]] = []
     repairs: dict[tuple[str, str], dict[str, Any]] = {}
@@ -966,6 +1076,17 @@ def audit_case(
             continue
 
         if not rule:
+            if category == "DATA_FLOW" and state == "DISABLED":
+                verifications[
+                    (record.system_id, record.resource_id, "VERIFY_DATA_FLOW_DISABLED")
+                ] = make_step(
+                    "VERIFICATION",
+                    record.system_id,
+                    record.resource_id,
+                    "VERIFY_DATA_FLOW_DISABLED",
+                    "DISABLED",
+                    record.evidence_id,
+                )
             continue
         pii_present = pii_fields_present(record, subject)
         if rule == "DELETE" and state not in {"ABSENT", "REDACTED", "ANONYMIZED"}:
@@ -989,11 +1110,87 @@ def audit_case(
                 findings.append(make_step("FINDING", record.system_id, record.resource_id, "REPORT_EXPOSED_PII", "PRESENT", record.evidence_id))
                 repairs[(record.system_id, record.resource_id)] = make_step("REMEDIATION", record.system_id, record.resource_id, "ANONYMIZE_RECORD", "ANONYMIZED", "")
                 verifications[(record.system_id, record.resource_id, "VERIFY_RECORD_ANONYMIZED")] = make_step("VERIFICATION", record.system_id, record.resource_id, "VERIFY_RECORD_ANONYMIZED", "ANONYMIZED", "")
-            elif state == "ANONYMIZED":
+            elif state == "ANONYMIZED" or not pii_present:
                 verifications[(record.system_id, record.resource_id, "VERIFY_RECORD_ANONYMIZED")] = make_step("VERIFICATION", record.system_id, record.resource_id, "VERIFY_RECORD_ANONYMIZED", "ANONYMIZED", record.evidence_id)
         elif rule == "RETAIN":
-            if state not in {"ABSENT", "NOT_FOUND"}:
+            if category == "BACKUP_ARCHIVE" and state == "BLOCKED":
+                verifications[
+                    (record.system_id, record.resource_id, "VERIFY_RESTORE_BLOCKED")
+                ] = make_step(
+                    "VERIFICATION",
+                    record.system_id,
+                    record.resource_id,
+                    "VERIFY_RESTORE_BLOCKED",
+                    "BLOCKED",
+                    record.evidence_id,
+                )
+            elif state not in {"ABSENT", "NOT_FOUND"}:
                 verifications[(record.system_id, record.resource_id, "VERIFY_RECORD_PRESENT")] = make_step("VERIFICATION", record.system_id, record.resource_id, "VERIFY_RECORD_PRESENT", "PRESENT", record.evidence_id)
+    account_records = [r for r in evidence if r.category == "USER_PROFILE"]
+    for record in account_records:
+        if status_from_record(record) == "ABSENT":
+            verifications[(record.system_id, record.resource_id, "VERIFY_RECORD_ABSENT")] = make_step(
+                "VERIFICATION", record.system_id, record.resource_id, "VERIFY_RECORD_ABSENT", "ABSENT", record.evidence_id
+            )
+
+    if account_resource and not any(
+        step["system_id"] == "account_service"
+        and step["operation"] == "VERIFY_RECORD_ABSENT"
+        and step["resource_id"] == account_resource
+        for step in verifications.values()
+    ):
+        if violation:
+            verifications[
+                ( "account_service", account_resource, "VERIFY_RECORD_ABSENT")
+            ] = make_step(
+                "VERIFICATION",
+                "account_service",
+                account_resource,
+                "VERIFY_RECORD_ABSENT",
+                "ABSENT",
+                "",
+            )
+        else:
+            activity_time = parse_time(account_activity.get("event_time", ""))
+            audit_at = parse_time(request.get("audit_at"))
+            scopes = []
+            for record in records:
+                if (
+                    record.category != "SNAPSHOT_SCOPE"
+                    or record.system_id != "account_service"
+                    or not available_at_cutoff(record, audit_at)
+                ):
+                    continue
+                table_names = set(record.snapshot_tables)
+                collection = str(record.values.get("collection", ""))
+                table_names.add(collection)
+                covers_profiles = any(
+                    category_for({"table": table_name}, "")
+                    == "USER_PROFILE"
+                    for table_name in table_names
+                )
+                snapshot_at = parse_time(
+                    str(record.values.get("snapshot_at") or record.captured_at)
+                )
+                if (
+                    covers_profiles
+                    and snapshot_at
+                    and activity_time
+                    and snapshot_at >= activity_time
+                ):
+                    scopes.append((snapshot_at, record))
+            if scopes:
+                _, scope = max(scopes, key=lambda item: item[0])
+                verifications[
+                    ("account_service", account_resource, "VERIFY_RECORD_ABSENT")
+                ] = make_step(
+                    "VERIFICATION",
+                    "account_service",
+                    account_resource,
+                    "VERIFY_RECORD_ABSENT",
+                    "ABSENT",
+                    scope.evidence_id,
+                )
 
     if not violation and not verifications:
         scope_by_system: dict[str, EvidenceRecord] = {}
@@ -1033,13 +1230,6 @@ def audit_case(
                     "ABSENT",
                     scope.evidence_id,
                 )
-
-    account_records = [r for r in evidence if r.category == "USER_PROFILE"]
-    for record in account_records:
-        if status_from_record(record) == "ABSENT":
-            verifications[(record.system_id, record.resource_id, "VERIFY_RECORD_ABSENT")] = make_step(
-                "VERIFICATION", record.system_id, record.resource_id, "VERIFY_RECORD_ABSENT", "ABSENT", record.evidence_id
-            )
 
     phase_steps = findings + list(repairs.values()) + list(verifications.values())
     if not violation:

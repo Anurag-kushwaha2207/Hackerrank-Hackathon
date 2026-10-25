@@ -35,7 +35,11 @@ evidence-backed absence only when both the evidence capture and snapshot time
 are at or before the case's `audit_at`.
 Structured JSON logs retain their event fields, replica system names normalize
 to canonical services, and identity-link activity alone is not treated as
-proof that a deletable record exists.
+proof that a deletable record exists. Identity links join to actual evidence
+only by exact resource ID. Empty SQL tables provide table-scoped snapshot
+coverage; account activity is used only to correlate a likely resource with a
+request, while the activity result itself is never accepted as proof of
+deletion.
 
 ## Package
 

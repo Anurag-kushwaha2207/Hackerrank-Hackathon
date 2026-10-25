@@ -212,6 +212,24 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(record.values["event_time"], "2026-02-03T05:53:54Z")
         self.assertEqual(audit.status_from_record(record), "ABSENT")
 
+    def test_resource_readback_trace_prefix_links_identity_lookup(self) -> None:
+        record = audit.parse_text_record(
+            '2026-02-03T05:53:54Z service=account_service '
+            'trace_id=rb-095409-021 resource_id=account_1234 '
+            'event=profile_lookup_completed rows=0 http_status=404',
+            {"file_id": "evidence_readback", "captured_at": "2026-02-03T06:00:00Z"},
+        )
+        self.assertIsNotNone(record)
+        self.assertEqual(record.values["trace_id"], "rb-095409-021")
+        record.source_text = (
+            '2026-02-03T05:53:50Z service=account_service '
+            'trace_id=rb-095409-021 event=profile_lookup_started '
+            'lookup_key=person@example.test\n' + record.source_text
+        )
+        subject = audit.Subject("case_readback", "person@example.test", None)
+        subject.add("person@example.test")
+        self.assertTrue(audit.linked_record(record, subject))
+
     def test_replica_names_resolve_to_canonical_system(self) -> None:
         self.assertEqual(
             audit.system_for({"service": "support_replica"}, "support_1234"),
@@ -234,7 +252,158 @@ class ContractTests(unittest.TestCase):
             subject,
         )
         self.assertEqual(len(record), 1)
-        self.assertEqual(record[0].category, "UNKNOWN")
+        self.assertEqual(record[0].category, "IDENTITY_LINK")
+
+    def test_contact_index_is_a_deletable_secondary_identifier(self) -> None:
+        self.assertEqual(
+            audit.category_for(
+                {"event": "deletion_marker_check"},
+                "support_1234",
+                "event=contact_query_started lookup_key=person@example.test "
+                "source=legacy_contact_index",
+            ),
+            "SECONDARY_IDENTIFIER",
+        )
+
+    def test_contact_opt_in_record_uses_marketing_deletion_policy(self) -> None:
+        category = audit.category_for(
+            {"event": "contact_lookup_completed", "email_opt_in": "true"},
+            "analytics_1234",
+        )
+        self.assertEqual(category, "MARKETING_PROFILE")
+        self.assertEqual(
+            audit.required_action(
+                audit.EvidenceRecord(
+                    "analytics_1234",
+                    "analytics_platform",
+                    category,
+                    {"email": "person@example.test"},
+                    "evidence_opt_in",
+                    "2026-01-01T00:00:00Z",
+                ),
+                {"MARKETING_PROFILE": {"required_action": "DELETE", "condition": "Always"}},
+                audit.Subject("case_opt_in", "person@example.test", None),
+                None,
+            ),
+            "DELETE",
+        )
+
+    def test_restore_candidate_without_deletion_block_is_active(self) -> None:
+        record = audit.EvidenceRecord(
+            "backup_1234",
+            "backup_service",
+            "BACKUP_ARCHIVE",
+            {"eligible": "true", "deletion_block": "false"},
+            "evidence_restore_candidate",
+            "2026-01-01T00:00:00Z",
+        )
+        self.assertEqual(audit.status_from_record(record), "ACTIVE")
+        self.assertEqual(audit.active_risk(record), "REPORT_RESTORE_RISK")
+
+    def test_blocked_restore_is_verified_as_blocked(self) -> None:
+        record = audit.EvidenceRecord(
+            "backup_1234",
+            "backup_service",
+            "BACKUP_ARCHIVE",
+            {"restore_allowed": "false"},
+            "evidence_restore_blocked",
+            "2026-01-01T00:00:00Z",
+        )
+        self.assertEqual(audit.status_from_record(record), "BLOCKED")
+        self.assertEqual(
+            audit.required_action(
+                record,
+                {"BACKUP_ARCHIVE": {"required_action": "RETAIN", "condition": "Always"}},
+                audit.Subject("case_restore", "person@example.test", None),
+                None,
+            ),
+            "RETAIN",
+        )
+
+    def test_account_deletion_activity_is_correlated_only_when_unambiguous(self) -> None:
+        request = {
+            "reported_at": "2026-01-01T12:00:00Z",
+            "audit_at": "2026-01-02T00:00:00Z",
+        }
+        activity = {
+            "target_system": "account_service",
+            "event_type": "DELETE_RECORD",
+            "source_system": "deletion_worker",
+            "event_time": "2026-01-01T11:59:30Z",
+            "resource_id": "account_1234",
+        }
+        self.assertEqual(
+            audit.reported_account_deletion_activity(request, [activity]),
+            activity,
+        )
+        competing = dict(
+            activity,
+            resource_id="account_5678",
+            event_time="2026-01-01T12:01:00Z",
+        )
+        self.assertIsNone(
+            audit.reported_account_deletion_activity(request, [activity, competing])
+        )
+
+    def test_sql_table_without_rows_still_provides_scoped_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="deletion-audit-sql-") as temporary:
+            path = Path(temporary) / "accounts.sql"
+            path.write_text(
+                "CREATE TABLE customer_profiles_failover_replica "
+                "(resource_id TEXT, email TEXT);",
+                encoding="utf-8",
+            )
+            records = audit.sql_records(
+                path,
+                {
+                    "file_id": "evidence_empty_account_table",
+                    "captured_at": "2026-01-01T00:00:00Z",
+                },
+            )
+        scopes = [record for record in records if record.category == "SNAPSHOT_SCOPE"]
+        self.assertEqual(len(scopes), 1)
+        self.assertEqual(scopes[0].system_id, "account_service")
+        self.assertEqual(scopes[0].snapshot_tables, ("customer_profiles_failover_replica",))
+
+    def test_identity_link_joins_only_to_matching_evidence_resource(self) -> None:
+        record = audit.EvidenceRecord(
+            resource_id="account_1234",
+            system_id="account_service",
+            category="USER_PROFILE",
+            values={"rows": "0", "http_status": "404"},
+            evidence_id="evidence_profile_lookup",
+            captured_at="2026-01-01T01:00:00Z",
+        )
+        result = audit.audit_case(
+            {
+                "case_id": "case_linked_resource",
+                "email": "person@example.test",
+                "audit_at": "2026-01-02T00:00:00Z",
+                "request_text": "Please delete my account.",
+            },
+            [record],
+            [{
+                "activity_id": "activity_link",
+                "event_time": "2026-01-01T00:00:00Z",
+                "event_type": "LINK_RESOURCE_IDENTITY",
+                "system_id": "data_catalog",
+                "resource_id": "account_1234",
+                "details": "Resource account_1234 belongs to user_07.",
+            }],
+            {"USER_PROFILE": {"required_action": "DELETE", "condition": "Always"}},
+            {"person@example.test": {"user_07"}},
+            {},
+            [],
+        )
+        self.assertEqual(result["deletion_status"], "COMPLETE")
+        self.assertEqual(
+            result["steps"][0]["resource_id"],
+            "account_1234",
+        )
+        self.assertEqual(
+            result["steps"][0]["evidence_id"],
+            "evidence_profile_lookup",
+        )
 
     def test_unrelated_direct_identifier_does_not_mark_record_as_subject_pii(self) -> None:
         record = audit.EvidenceRecord(
